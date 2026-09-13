@@ -21,5 +21,8 @@ jobs:
       - name: Install dependencies
         run: npm install --no-audit --no-fund
 
+      - name: Run engine regression tests
+        run: npm test
+
       - name: Build production app
         run: npm run build
