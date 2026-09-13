@@ -17,6 +17,10 @@ export const CONFIDENCE_BUCKETS = Object.freeze([
 
 export function normalizeDigits(values) {
   return (Array.isArray(values) ? values : [])
+    .filter(value => {
+      if (typeof value === 'number') return Number.isFinite(value);
+      return typeof value === 'string' && value.trim() !== '';
+    })
     .map(Number)
     .filter(Number.isInteger)
     .filter(d => d >= 0 && d <= 9);
@@ -263,48 +267,39 @@ export function analyze(input, calibration, config = ENGINE_CONFIG) {
 
   return {
     ...raw,
-    confidence: calibrated.confidence,
+    signal: qualified,
     probability: calibrated.probability,
+    confidence: calibrated.confidence,
     calibrated: calibrated.calibrated,
     calibrationSamples: calibrated.sampleSize,
-    signal: qualified,
-    reason: qualified
-      ? (calibrated.calibrated ? 'Validated by walk-forward calibration' : raw.reason)
-      : 'Calibration did not confirm enough edge'
+    reason: qualified ? raw.reason : 'Calibration does not confirm a sufficient edge'
   };
 }
 
 export function parseContractTypes(message) {
-  const cf = message?.contracts_for;
-  if (!cf) return [];
-  const list = Array.isArray(cf)
-    ? cf
-    : Object.values(cf).flatMap(value => Array.isArray(value) ? value : []);
-
-  return list
-    .map(item => typeof item === 'string'
-      ? item
-      : (item?.contract_type || item?.contract_category || item?.type || ''))
-    .filter(Boolean)
-    .map(String)
-    .map(value => value.toUpperCase());
+  if (!Array.isArray(message?.contracts_for)) return [];
+  return message.contracts_for
+    .map(contract => contract?.contract_type)
+    .filter(Boolean);
 }
 
 export function supportsMatches(message) {
   return parseContractTypes(message).some(type =>
-    type === 'DIGITMATCH' || type.includes('DIGITMATCH') || type === 'MATCHDIGIT'
+    ['DIGITMATCH', 'DIGITDIFF'].includes(type)
   );
 }
 
 export function benchmarkScore(result) {
-  return (result.validated.edge * 2)
-    + Math.min(result.validated.signals, 100) * 0.05
-    - (result.validated.brier ?? 1) * 10
-    - result.validated.maxLosingStreak * 0.12;
+  const validated = result?.validated || {};
+  const edge = Number(validated.edge) || 0;
+  const signals = Number(validated.signals) || 0;
+  const brier = Number(validated.brier) || 0;
+  const streak = Number(validated.maxLosingStreak) || 0;
+  return edge * 2 + Math.min(signals, 100) * 0.05 - brier * 10 - streak * 0.12;
 }
 
 export function benchmarkRank(results) {
-  return [...results]
-    .filter(result => result.error == null && result.validated)
-    .sort((a, b) => benchmarkScore(b) - benchmarkScore(a));
+  return [...(Array.isArray(results) ? results : [])]
+    .map(result => ({ ...result, rankScore: benchmarkScore(result) }))
+    .sort((a, b) => b.rankScore - a.rankScore);
 }
