@@ -3,13 +3,13 @@ import { analyze, lastDigit, normalizeDigits, walkForwardBacktest } from './engi
 
 const API_URL = 'wss://api.derivws.com/trading/v1/options/ws/public';
 const MIN_TICKS = 100;
-const WARMUP_TICKS = 1500;
+const WARMUP_TICKS = 400;
 const BACKTEST_TICKS = 1500;
 const BENCHMARK_TICKS = 1500;
 const MAX_BENCHMARK_MARKETS = 12;
 const MIN_CALIBRATION_SAMPLES = 20;
 const TICK_STALE_MS = 12000;
-const UI_TICK_FLUSH_MS = 75;
+const UI_TICK_FLUSH_MS = 25;
 
 function normalizeActiveSymbol(item) {
   const symbol = item?.underlying_symbol ?? item?.symbol;
@@ -161,12 +161,12 @@ export default function App() {
       const liveTail = tickBufferRef.current.slice(-25);
       tickBufferRef.current = [...prices.slice(-2999), ...liveTail].slice(-3000);
       setTicks([...tickBufferRef.current]);
-      setBacktestState({ loading: false, error: '', result: walkForwardBacktest(prices) });
       if (pip != null) setServerPipSize(pip);
-      setStatus('History loaded — live Deriv ticks streaming');
+      setBacktestState({ loading: false, result: null, error: '' });
+      setStatus(`LIVE STREAM ACTIVE — ${prices.length} history ticks loaded`);
     } else {
       setBacktestState({ loading: false, result: null, error: `Deriv returned only ${prices.length} usable historical ticks.` });
-      setStatus('Live ticks streaming — warming model');
+      setStatus('LIVE STREAM ACTIVE — warming model');
     }
   }
 
@@ -177,7 +177,7 @@ export default function App() {
       else if (warmupReqIdRef.current === message.req_id) {
         warmupReqIdRef.current = null;
         setBacktestState({ loading: false, result: null, error: text });
-        setStatus('Live ticks streaming — history preload unavailable');
+        setStatus('LIVE STREAM ACTIVE — history preload unavailable');
       } else if (backtestReqIdRef.current === message.req_id) {
         backtestReqIdRef.current = null;
         setBacktestState({ loading: false, result: null, error: text });
@@ -278,14 +278,18 @@ export default function App() {
     setBacktestState({ loading: true, result: null, error: '' });
     pending.current = null;
 
+    // Start the live stream BEFORE requesting history/contracts. The UI should never wait for warm-up.
     send({ forget_all: 'ticks', req_id: requestId.current++ });
-    send({ contracts_for: symbol, req_id: requestId.current++ });
+    const tickReqId = requestId.current++;
+    if (!send({ ticks: symbol, subscribe: 1, req_id: tickReqId })) {
+      setError('Could not start the Deriv tick subscription.');
+      return;
+    }
     const warmupReqId = requestId.current++;
     warmupReqIdRef.current = warmupReqId;
     send({ ticks_history: symbol, end: 'latest', count: WARMUP_TICKS, style: 'ticks', subscribe: 0, req_id: warmupReqId });
-    const tickReqId = requestId.current++;
-    if (!send({ ticks: symbol, subscribe: 1, req_id: tickReqId })) { setError('Could not start the Deriv tick subscription.'); return; }
-    setStatus('Loading recent ticks + streaming live Deriv ticks');
+    send({ contracts_for: symbol, req_id: requestId.current++ });
+    setStatus('LIVE STREAM STARTING — receiving real Deriv ticks');
   }, [connected, symbol]);
 
   useEffect(() => {
@@ -345,11 +349,11 @@ export default function App() {
       <section className="controls card"><label>Market<select value={symbol} onChange={event => setSymbol(event.target.value)} disabled={!symbols.length}>{!symbols.length && <option value="">Waiting for active Deriv markets…</option>}{symbols.map(item => <option key={item.symbol} value={item.symbol}>{item.displayName}</option>)}</select></label><div className={`metric ${eligible === true ? 'ok' : eligible === false ? 'bad' : ''}`}><span>Matches</span><strong>{eligible === true ? 'ELIGIBLE' : eligible === false ? 'NOT AVAILABLE' : '…'}</strong></div><div className="metric"><span>Ticks</span><strong>{ticks.length}</strong></div><div className="metric"><span>Live hit</span><strong>{liveHitRate}{settled ? '%' : ''}</strong></div></section>
       <section className="card eligibility"><div><b>{status}</b><small>{selectedName} • pip size {serverPipSize ?? 'auto'} • {streamSymbol ? `stream: ${streamSymbol}` : 'waiting for tick stream'}</small></div><span className={lastTickAt && tickAge <= 12 ? 'badge ok' : connected ? 'badge' : 'badge bad'}>{lastTickAt && tickAge <= 12 ? `REAL DERIV TICKS${tickAge === 0 ? '' : ` • ${tickAge}s ago`}` : connected ? 'WAITING FOR TICKS' : 'OFFLINE'}</span></section>
       {error && <div className="card error">{error}</div>}
-      <section className="card eligibility"><div><b>{eligibilityText}</b><small>{symbols.length} active Deriv market{symbols.length === 1 ? '' : 's'} discovered dynamically • history preload {WARMUP_TICKS} ticks • no hard-coded synthetic symbol is assumed valid</small></div><span className={eligible === true ? 'badge ok' : eligible === false ? 'badge bad' : 'badge'}>{eligible === true ? 'CONTRACT READY' : eligible === false ? 'NOT OFFERED' : 'VERIFYING'}</span></section>
+      <section className="card eligibility"><div><b>{eligibilityText}</b><small>{symbols.length} active Deriv market{symbols.length === 1 ? '' : 's'} discovered dynamically • fast history warm-up {WARMUP_TICKS} ticks • no hard-coded synthetic symbol is assumed valid</small></div><span className={eligible === true ? 'badge ok' : eligible === false ? 'badge bad' : 'badge'}>{eligible === true ? 'CONTRACT READY' : eligible === false ? 'NOT OFFERED' : 'VERIFYING'}</span></section>
       <section className="hero card"><div><span className="eyebrow">NEXT MATCH CANDIDATE</span>{analysis.signal ? <div className="big-digit">{analysis.digit}</div> : <div className="no-signal">NO SIGNAL</div>}<p>{analysis.reason}. Estimated probability: <strong>{Number(analysis.probability || 10).toFixed(1)}%</strong> • Confidence: <strong>{Number(analysis.confidence || 0).toFixed(1)}%</strong></p><small>{analysis.calibrated ? `Calibrated from ${analysis.calibrationSamples} validation samples` : 'Calibration pending • model is statistical, not guaranteed'}</small></div><div className="hero-side"><span>Model state</span><strong>{ticks.length < MIN_TICKS ? 'WARMING UP' : analysis.signal ? 'QUALIFIED' : 'WAITING'}</strong><small>{Math.max(0, MIN_TICKS - ticks.length)} observations until full warm-up</small></div></section>
       <section className="grid"><div className="card"><div className="section-title"><h2>Digit distribution</h2><span>Last {Math.min(100, ticks.length)}</span></div><div className="digits">{counts.map((count, digit) => <div className="digit-row" key={digit}><b>{digit}</b><div className="bar"><i style={{ width: `${count / maxCount * 100}%` }}/></div><span>{count}</span></div>)}</div></div><div className="card"><div className="section-title"><h2>Live audit</h2><span>{predictions.length} settled</span></div><div className="audit">{predictions.length ? predictions.slice(0, 10).map((item, index) => <div className="audit-row" key={`${item.at}-${index}`}><b>{item.digit}</b><span>{item.confidence.toFixed(0)}%</span><span>{item.probability.toFixed(1)}%</span><strong className={item.result === 'WIN' ? 'win' : 'loss'}>{item.result}</strong></div>) : <p className="muted">No settled predictions yet.</p>}</div></div></section>
       <section className="card validation"><div className="section-title"><div><h2>Multi-market benchmark</h2><small>Ranks only markets actually returned by Deriv. No unavailable or hard-coded symbols are tested.</small></div><button onClick={runBenchmark} disabled={benchmark.loading || !symbols.length}>{benchmark.loading ? `SCANNING ${benchmark.completed}/${benchmark.total}` : 'SCAN BEST MARKET'}</button></div>{benchmark.error && <div className="error inline">{benchmark.error}</div>}{best && <div className={`validation-status ${bestReady ? 'ready' : 'hold'}`}><b>{bestReady ? 'BEST VALIDATED MARKET' : 'NO PROMOTED MARKET'}</b><span>{best.name} • {best.validated.hitRate.toFixed(1)}% hit • {best.validated.edge >= 0 ? '+' : ''}{best.validated.edge.toFixed(1)}% edge • {best.validated.signals} unseen signals</span></div>}<div className="calibration-table"><div className="cal-head"><span>Rank</span><span>Market</span><span>Hit</span><span>Edge</span></div>{benchmark.results.length ? benchmark.results.slice(0, 8).map((row, index) => <div className="cal-row" key={row.symbol}><span>#{index + 1}</span><span>{row.name}</span><span>{row.validated.hitRate.toFixed(1)}%</span><span>{row.validated.edge >= 0 ? '+' : ''}{row.validated.edge.toFixed(1)}%</span></div>) : <p className="muted">Run the benchmark to compare real active markets. A market is not promoted automatically without unseen validation.</p>}</div></section>
-      <section className="card validation"><div className="section-title"><div><h2>Walk-forward validation</h2><small>70% calibration / 30% unseen validation • next-tick causality • automatically warmed on market selection</small></div><button onClick={runBacktest} disabled={backtestState.loading || !symbol}>{backtestState.loading ? 'RUNNING…' : 'RUN VALIDATION'}</button></div>{backtestState.error && <div className="error inline">{backtestState.error}</div>}{!backtestState.result && !backtestState.loading && <p className="muted">Run validation to measure whether the model has a real edge on the selected live Deriv market.</p>}{backtestState.result && validated && <><div className="validation-grid"><div><span>Validation hit</span><strong>{validated.hitRate.toFixed(1)}%</strong></div><div><span>Edge vs 10%</span><strong>{validated.edge >= 0 ? '+' : ''}{validated.edge.toFixed(1)}%</strong></div><div><span>Signals</span><strong>{validated.signals}</strong></div><div><span>Max loss streak</span><strong>{validated.maxLosingStreak}</strong></div><div><span>Avg predicted</span><strong>{validated.avgProbability.toFixed(1)}%</strong></div><div><span>Brier score</span><strong>{validated.brier == null ? '—' : validated.brier.toFixed(3)}</strong></div></div><div className={`validation-status ${validationReady ? 'ready' : 'hold'}`}><b>{validationReady ? 'CALIBRATION READY' : 'HOLD / MORE DATA'}</b><span>{validationReady ? 'Live signals may use empirical calibration.' : 'The app stays conservative until enough unseen samples confirm an edge.'}</span></div><div className="calibration-table"><div className="cal-head"><span>Confidence</span><span>Samples</span><span>Actual hit</span><span>Status</span></div>{backtestState.result.calibration.buckets.map((bucket, index) => <div className="cal-row" key={index}><span>{bucket.lo}–{bucket.hi}%</span><span>{bucket.count}</span><span>{bucket.count ? `${bucket.hitRate.toFixed(1)}%` : '—'}</span><span>{bucket.count >= MIN_CALIBRATION_SAMPLES ? 'VALID' : 'THIN'}</span></div>)}</div><p className="muted">Raw validation: {backtestState.result.raw.hitRate.toFixed(1)}% • Calibrated validation: {validated.hitRate.toFixed(1)}% • Statistical validation is not guaranteed profit.</p></>}</section>
+      <section className="card validation"><div className="section-title"><div><h2>Walk-forward validation</h2><small>Manual validation • next-tick causality • kept off the live tick path for maximum responsiveness</small></div><button onClick={runBacktest} disabled={backtestState.loading || !symbol}>{backtestState.loading ? 'RUNNING…' : 'RUN VALIDATION'}</button></div>{backtestState.error && <div className="error inline">{backtestState.error}</div>}{!backtestState.result && !backtestState.loading && <p className="muted">Run validation to measure whether the model has a real edge on the selected live Deriv market.</p>}{backtestState.result && validated && <><div className="validation-grid"><div><span>Validation hit</span><strong>{validated.hitRate.toFixed(1)}%</strong></div><div><span>Edge vs 10%</span><strong>{validated.edge >= 0 ? '+' : ''}{validated.edge.toFixed(1)}%</strong></div><div><span>Signals</span><strong>{validated.signals}</strong></div><div><span>Max loss streak</span><strong>{validated.maxLosingStreak}</strong></div><div><span>Avg predicted</span><strong>{validated.avgProbability.toFixed(1)}%</strong></div><div><span>Brier score</span><strong>{validated.brier == null ? '—' : validated.brier.toFixed(3)}</strong></div></div><div className={`validation-status ${validationReady ? 'ready' : 'hold'}`}><b>{validationReady ? 'CALIBRATION READY' : 'HOLD / MORE DATA'}</b><span>{validationReady ? 'Live signals may use empirical calibration.' : 'The app stays conservative until enough unseen samples confirm an edge.'}</span></div><div className="calibration-table"><div className="cal-head"><span>Confidence</span><span>Samples</span><span>Actual hit</span><span>Status</span></div>{backtestState.result.calibration.buckets.map((bucket, index) => <div className="cal-row" key={index}><span>{bucket.lo}–{bucket.hi}%</span><span>{bucket.count}</span><span>{bucket.count ? `${bucket.hitRate.toFixed(1)}%` : '—'}</span><span>{bucket.count >= MIN_CALIBRATION_SAMPLES ? 'VALID' : 'THIN'}</span></div>)}</div><p className="muted">Raw validation: {backtestState.result.raw.hitRate.toFixed(1)}% • Calibrated validation: {validated.hitRate.toFixed(1)}% • Statistical validation is not guaranteed profit.</p></>}</section>
     </main>
   </div>;
 }
