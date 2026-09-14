@@ -6,7 +6,8 @@ import {
   walkForwardBacktest
 } from './engine/matchesEngine.js';
 
-const API_URL = 'wss://ws.derivws.com/websockets/v3?app_id=1089';
+// Current Deriv public market-data WebSocket. No App ID/authentication is required.
+const API_URL = 'wss://api.derivws.com/trading/v1/options/ws/public';
 const MIN_TICKS = 100;
 const BACKTEST_TICKS = 1500;
 const BENCHMARK_TICKS = 1500;
@@ -94,16 +95,6 @@ export default function App() {
     if (ws.current?.readyState !== WebSocket.OPEN) return false;
     ws.current.send(JSON.stringify(payload));
     return true;
-  };
-
-  const handleServerError = (message) => {
-    const text = message || 'Deriv API returned an error.';
-    if (benchmarkRef.current?.reqId === message?.req_id) {
-      finishBenchmarkItem({ error: text });
-      return;
-    }
-    setError(text);
-    setStatus('Deriv feed error');
   };
 
   function finishBenchmarkItem(payload) {
@@ -233,9 +224,10 @@ export default function App() {
       socket.onopen = () => {
         if (!mounted.current) return;
         setConnected(true);
-        setStatus('Connected to Deriv');
+        setStatus('Connected to Deriv — requesting active markets…');
         setError('');
         activeSymbolReady.current = false;
+        // Current public endpoint accepts the lean active_symbols request.
         send({ active_symbols: 'brief', req_id: requestId.current++ });
       };
 
@@ -250,14 +242,14 @@ export default function App() {
       socket.onerror = () => {
         if (!mounted.current) return;
         setConnected(false);
-        setStatus('Deriv WebSocket error');
+        setStatus('Deriv WebSocket error — retrying…');
       };
 
       socket.onclose = () => {
         if (!mounted.current) return;
         setConnected(false);
         activeSymbolReady.current = false;
-        setStatus('Disconnected — reconnecting…');
+        setStatus('Disconnected — reconnecting to Deriv…');
         clearTimeout(reconnectTimer.current);
         reconnectTimer.current = setTimeout(connect, 2500);
       };
