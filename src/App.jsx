@@ -6,14 +6,16 @@ import {
   walkForwardBacktest
 } from './engine/matchesEngine.js';
 
-// Current Deriv public market-data WebSocket. No App ID/authentication is required.
+// Deriv's current public market-data WebSocket. No App ID/authentication is required.
 const API_URL = 'wss://api.derivws.com/trading/v1/options/ws/public';
 const MIN_TICKS = 100;
+const WARMUP_TICKS = 1500;
 const BACKTEST_TICKS = 1500;
 const BENCHMARK_TICKS = 1500;
 const MAX_BENCHMARK_MARKETS = 12;
 const MIN_CALIBRATION_SAMPLES = 20;
 const TICK_STALE_MS = 12000;
+const UI_TICK_FLUSH_MS = 75;
 
 function normalizeActiveSymbol(item) {
   const symbol = item?.underlying_symbol ?? item?.symbol;
@@ -87,15 +89,60 @@ export default function App() {
   const reconnectTimer = useRef(null);
   const heartbeatTimer = useRef(null);
   const mounted = useRef(true);
+  const selectedSymbolRef = useRef('');
+  const marketMapRef = useRef(new Map());
+  const tickBufferRef = useRef([]);
+  const lastTickAtRef = useRef(null);
+  const tickFlushTimer = useRef(null);
+  const warmupReqIdRef = useRef(null);
+  const sessionRef = useRef(0);
 
   const calibration = backtestState.result?.calibration || null;
   const selectedMarket = symbols.find(item => item.symbol === symbol);
 
+  useEffect(() => {
+    selectedSymbolRef.current = symbol;
+  }, [symbol]);
+
   const send = (payload) => {
     if (ws.current?.readyState !== WebSocket.OPEN) return false;
-    ws.current.send(JSON.stringify(payload));
-    return true;
+    try {
+      ws.current.send(JSON.stringify(payload));
+      return true;
+    } catch {
+      return false;
+    }
   };
+
+  function flushTickBuffer() {
+    tickFlushTimer.current = null;
+    if (!mounted.current) return;
+    setTicks([...tickBufferRef.current]);
+    setLastTickAt(lastTickAtRef.current);
+  }
+
+  function scheduleTickFlush() {
+    if (tickFlushTimer.current != null) return;
+    tickFlushTimer.current = window.setTimeout(flushTickBuffer, UI_TICK_FLUSH_MS);
+  }
+
+  function resetTickBuffer() {
+    tickBufferRef.current = [];
+    lastTickAtRef.current = null;
+    if (tickFlushTimer.current != null) {
+      clearTimeout(tickFlushTimer.current);
+      tickFlushTimer.current = null;
+    }
+    setTicks([]);
+    setLastTickAt(null);
+  }
+
+  function pushLiveTick(digit, incomingSymbol) {
+    tickBufferRef.current = [...tickBufferRef.current.slice(-2999), digit];
+    lastTickAtRef.current = Date.now();
+    if (incomingSymbol && incomingSymbol !== streamSymbol) setStreamSymbol(incomingSymbol);
+    scheduleTickFlush();
+  }
 
   function finishBenchmarkItem(payload) {
     const state = benchmarkRef.current;
@@ -133,7 +180,7 @@ export default function App() {
     const reqId = requestId.current++;
     state.reqId = reqId;
     state.currentSymbol = nextSymbol;
-    send({ ticks_history: nextSymbol, end: 'latest', count: BENCHMARK_TICKS, style: 'ticks', req_id: reqId });
+    send({ ticks_history: nextSymbol, end: 'latest', count: BENCHMARK_TICKS, style: 'ticks', subscribe: 0, req_id: reqId });
   }
 
   function processHistory(message) {
@@ -148,10 +195,19 @@ export default function App() {
       return;
     }
 
+    if (warmupReqIdRef.current !== message?.req_id) return;
+    warmupReqIdRef.current = null;
+
     if (prices.length >= MIN_TICKS + 1) {
+      const liveTail = tickBufferRef.current.slice(-25);
+      tickBufferRef.current = [...prices.slice(-2999), ...liveTail].slice(-3000);
+      setTicks([...tickBufferRef.current]);
       setBacktestState({ loading: false, error: '', result: walkForwardBacktest(prices) });
+      setServerPipSize(pip ?? selectedMarket?.pipSize ?? null);
+      setStatus('History loaded — live Deriv ticks streaming');
     } else {
       setBacktestState({ loading: false, result: null, error: `Deriv returned only ${prices.length} usable historical ticks.` });
+      setStatus('Live ticks streaming — warming model');
     }
   }
 
@@ -160,6 +216,10 @@ export default function App() {
       const text = message.error.message || 'Deriv API error.';
       if (benchmarkRef.current?.reqId === message.req_id || benchmarkRef.current?.contractReqId === message.req_id) {
         finishBenchmarkItem({ error: text });
+      } else if (warmupReqIdRef.current === message.req_id) {
+        warmupReqIdRef.current = null;
+        setBacktestState({ loading: false, result: null, error: text });
+        setStatus('Live ticks streaming — history preload unavailable');
       } else {
         setError(text);
         setStatus('Deriv feed error');
@@ -175,11 +235,12 @@ export default function App() {
       const usable = (synthetic.length ? synthetic : discovered)
         .sort((a, b) => a.displayName.localeCompare(b.displayName));
 
+      marketMapRef.current = new Map(usable.map(item => [item.symbol, item]));
       activeSymbolReady.current = usable.length > 0;
       setSymbols(usable);
       setError('');
       setStatus(usable.length ? 'Live market data ready' : 'Connected, but Deriv returned no active markets');
-      if (!usable.some(item => item.symbol === symbol)) setSymbol(usable[0]?.symbol || '');
+      if (!usable.some(item => item.symbol === selectedSymbolRef.current)) setSymbol(usable[0]?.symbol || '');
       return;
     }
 
@@ -197,14 +258,17 @@ export default function App() {
 
     if (message?.msg_type === 'tick' && message.tick?.quote != null) {
       const incomingSymbol = message.tick.symbol || message.echo_req?.ticks || '';
-      if (symbol && incomingSymbol && incomingSymbol !== symbol) return;
-      const pip = Number.isInteger(message.tick.pip_size) ? message.tick.pip_size : selectedMarket?.pipSize ?? null;
+      const currentSymbol = selectedSymbolRef.current;
+      if (!currentSymbol || (incomingSymbol && incomingSymbol !== currentSymbol)) return;
+
+      const market = marketMapRef.current.get(currentSymbol);
+      const rawPip = message.tick.pip_size ?? market?.pipSize ?? null;
+      const pip = Number.isInteger(rawPip) ? rawPip : null;
       const digit = lastDigit(message.tick.quote, pip);
       if (digit == null) return;
-      setServerPipSize(pip);
-      setStreamSymbol(incomingSymbol || symbol);
-      setLastTickAt(Date.now());
-      setTicks(previous => [...previous.slice(-2999), digit]);
+
+      if (pip != null && pip !== Number(serverPipSize)) setServerPipSize(pip);
+      pushLiveTick(digit, incomingSymbol || currentSymbol);
       return;
     }
 
@@ -227,7 +291,6 @@ export default function App() {
         setStatus('Connected to Deriv — requesting active markets…');
         setError('');
         activeSymbolReady.current = false;
-        // Current public endpoint accepts the lean active_symbols request.
         send({ active_symbols: 'brief', req_id: requestId.current++ });
       };
 
@@ -251,17 +314,18 @@ export default function App() {
         activeSymbolReady.current = false;
         setStatus('Disconnected — reconnecting to Deriv…');
         clearTimeout(reconnectTimer.current);
-        reconnectTimer.current = setTimeout(connect, 2500);
+        reconnectTimer.current = setTimeout(connect, 1500);
       };
     };
 
     connect();
-    heartbeatTimer.current = setInterval(() => send({ ping: 1, req_id: requestId.current++ }), 30000);
+    heartbeatTimer.current = setInterval(() => send({ ping: 1, req_id: requestId.current++ }), 25000);
 
     return () => {
       mounted.current = false;
       clearTimeout(reconnectTimer.current);
       clearInterval(heartbeatTimer.current);
+      if (tickFlushTimer.current != null) clearTimeout(tickFlushTimer.current);
       if (ws.current) {
         try { ws.current.close(); } catch {}
         ws.current = null;
@@ -271,30 +335,46 @@ export default function App() {
 
   useEffect(() => {
     if (!connected || !activeSymbolReady.current || !symbol) return;
-    send({ forget_all: 'ticks', req_id: requestId.current++ });
-    setTicks([]);
+
+    sessionRef.current += 1;
+    warmupReqIdRef.current = null;
+    resetTickBuffer();
     setPredictions([]);
-    setLastTickAt(null);
     setStreamSymbol('');
     setServerPipSize(selectedMarket?.pipSize ?? null);
     setEligible(null);
     setEligibilityText('Checking Matches support…');
-    setBacktestState({ loading: false, result: null, error: '' });
+    setBacktestState({ loading: true, result: null, error: '' });
     pending.current = null;
 
+    send({ forget_all: 'ticks', req_id: requestId.current++ });
     send({ contracts_for: symbol, req_id: requestId.current++ });
+
+    // Preload a large, recent history immediately. This removes the old 100-live-tick warm-up delay
+    // while also giving the model enough data for walk-forward calibration before live signals.
+    const warmupReqId = requestId.current++;
+    warmupReqIdRef.current = warmupReqId;
+    send({
+      ticks_history: symbol,
+      end: 'latest',
+      count: WARMUP_TICKS,
+      style: 'ticks',
+      subscribe: 0,
+      req_id: warmupReqId
+    });
+
     const tickReqId = requestId.current++;
     if (!send({ ticks: symbol, subscribe: 1, req_id: tickReqId })) {
       setError('Could not start the Deriv tick subscription.');
       return;
     }
-    setStatus('Streaming live Deriv ticks');
+    setStatus('Loading recent ticks + streaming live Deriv ticks');
   }, [connected, symbol]);
 
   useEffect(() => {
     if (!lastTickAt) return;
     const timer = setInterval(() => {
-      if (Date.now() - lastTickAt > TICK_STALE_MS) {
+      if (lastTickAtRef.current && Date.now() - lastTickAtRef.current > TICK_STALE_MS) {
         setStatus('Connected, but tick stream is stale');
       }
     }, 2000);
@@ -335,7 +415,7 @@ export default function App() {
       return;
     }
     setBacktestState({ loading: true, result: null, error: '' });
-    send({ ticks_history: symbol, end: 'latest', count: BACKTEST_TICKS, style: 'ticks', req_id: requestId.current++ });
+    send({ ticks_history: symbol, end: 'latest', count: BACKTEST_TICKS, style: 'ticks', subscribe: 0, req_id: requestId.current++ });
   }
 
   function runBenchmark() {
@@ -374,7 +454,7 @@ export default function App() {
       <div>
         <span className="eyebrow">DERIV • MATCHES ANALYSIS</span>
         <h1>Matches Analysis <b>PRO</b></h1>
-        <p>Live digit analysis using the actual active Deriv market list, real-time ticks, walk-forward validation and calibration.</p>
+        <p>Live digit analysis using real Deriv ticks, instant historical warm-up, multi-window scoring, walk-forward validation and calibration.</p>
       </div>
       <div className={connected && lastTickAt && tickAge <= 12 ? 'status live' : 'status'}>
         <i/> {connected && lastTickAt && tickAge <= 12 ? 'LIVE' : connected ? 'CONNECTED' : 'OFFLINE'}
@@ -408,7 +488,7 @@ export default function App() {
       {error && <div className="card error">{error}</div>}
 
       <section className="card eligibility">
-        <div><b>{eligibilityText}</b><small>{symbols.length} active Deriv market{symbols.length === 1 ? '' : 's'} discovered dynamically • no hard-coded synthetic symbol is assumed valid</small></div>
+        <div><b>{eligibilityText}</b><small>{symbols.length} active Deriv market{symbols.length === 1 ? '' : 's'} discovered dynamically • history preload {WARMUP_TICKS} ticks • no hard-coded synthetic symbol is assumed valid</small></div>
         <span className={eligible === true ? 'badge ok' : eligible === false ? 'badge bad' : 'badge'}>{eligible === true ? 'CONTRACT READY' : eligible === false ? 'NOT OFFERED' : 'VERIFYING'}</span>
       </section>
 
@@ -435,7 +515,7 @@ export default function App() {
       </section>
 
       <section className="card validation">
-        <div className="section-title"><div><h2>Walk-forward validation</h2><small>70% calibration / 30% unseen validation • next-tick causality</small></div><button onClick={runBacktest} disabled={backtestState.loading || !symbol}>{backtestState.loading ? 'RUNNING…' : 'RUN VALIDATION'}</button></div>
+        <div className="section-title"><div><h2>Walk-forward validation</h2><small>70% calibration / 30% unseen validation • next-tick causality • automatically warmed on market selection</small></div><button onClick={runBacktest} disabled={backtestState.loading || !symbol}>{backtestState.loading ? 'RUNNING…' : 'RUN VALIDATION'}</button></div>
         {backtestState.error && <div className="error inline">{backtestState.error}</div>}
         {!backtestState.result && !backtestState.loading && <p className="muted">Run validation to measure whether the model has a real edge on the selected live Deriv market.</p>}
         {backtestState.result && validated && <>
