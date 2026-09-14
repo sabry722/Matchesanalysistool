@@ -1,14 +1,16 @@
 export const ENGINE_CONFIG = Object.freeze({
   minTicks: 100,
-  recentWindow: 100,
-  shortWindow: 30,
-  minTransitionSamples: 8,
+  recentWindow: 120,
+  shortWindow: 40,
+  mediumWindow: 300,
+  transitionWindow: 400,
+  minTransitionSamples: 10,
   minCalibrationSamples: 20,
-  maxProbability: 40,
+  maxProbability: 30,
   baselineProbability: 10,
-  confidenceFloor: 24,
-  marginFloor: 0.012,
-  entropyCeiling: 0.995
+  confidenceFloor: 26,
+  marginFloor: 0.015,
+  entropyCeiling: 0.992
 });
 
 export const CONFIDENCE_BUCKETS = Object.freeze([
@@ -57,6 +59,10 @@ export function bucketIndex(confidence) {
   return i < 0 ? CONFIDENCE_BUCKETS.length - 1 : i;
 }
 
+function smoothedProbability(count, total, prior = 1) {
+  return (count + prior) / (total + prior * 10);
+}
+
 export function baseAnalyze(input, config = ENGINE_CONFIG) {
   const digits = normalizeDigits(input);
   if (digits.length < config.minTicks) {
@@ -68,61 +74,83 @@ export function baseAnalyze(input, config = ENGINE_CONFIG) {
       scores: Array(10).fill(0),
       reason: `Collecting ${config.minTicks - digits.length} more ticks`,
       entropy: 1,
-      margin: 0
+      margin: 0,
+      modelAgreement: 0,
+      componentVotes: 0
     };
   }
 
   const recent = digits.slice(-config.recentWindow);
   const short = digits.slice(-config.shortWindow);
+  const medium = digits.slice(-config.mediumWindow);
+  const transitionSource = digits.slice(-config.transitionWindow);
   const counts = Array(10).fill(0);
   const shortCounts = Array(10).fill(0);
+  const mediumCounts = Array(10).fill(0);
+
   recent.forEach(d => counts[d]++);
   short.forEach(d => shortCounts[d]++);
+  medium.forEach(d => mediumCounts[d]++);
 
-  const probs = counts.map(c => c / recent.length);
+  const probs = counts.map(c => smoothedProbability(c, recent.length));
   const normalizedEntropy = entropy(probs) / Math.log2(10);
   const scores = Array(10).fill(0);
   const last = digits.at(-1);
   const transitionCounts = Array.from({ length: 10 }, () => Array(10).fill(0));
 
-  for (let i = 1; i < digits.length; i++) transitionCounts[digits[i - 1]][digits[i]]++;
+  for (let i = 1; i < transitionSource.length; i++) {
+    transitionCounts[transitionSource[i - 1]][transitionSource[i]]++;
+  }
 
-  const reversed = [...digits].reverse();
   const row = transitionCounts[last];
   const transitions = row.reduce((a, b) => a + b, 0);
+  const mediumTotal = medium.length;
+  const shortTotal = short.length;
 
   for (let d = 0; d < 10; d++) {
     const longEdge = probs[d] - 0.10;
-    const shortEdge = shortCounts[d] / short.length - 0.10;
-    const transitionProb = transitions >= config.minTransitionSamples ? row[d] / transitions : 0.10;
-    const gap = reversed.indexOf(d);
-    const gapSignal = gap >= 8 && gap <= 35 ? 0.012 : 0;
-    const repeatPenalty = d === last ? -0.006 : 0;
+    const mediumEdge = smoothedProbability(mediumCounts[d], mediumTotal) - 0.10;
+    const shortEdge = smoothedProbability(shortCounts[d], shortTotal) - 0.10;
+    const transitionProb = transitions >= config.minTransitionSamples
+      ? smoothedProbability(row[d], transitions, 0.5)
+      : 0.10;
+    const transitionEdge = transitionProb - 0.10;
 
-    scores[d] = longEdge * 0.40
-      + shortEdge * 0.25
-      + (transitionProb - 0.10) * 0.30
-      + gapSignal
-      + repeatPenalty;
+    // Do not use "overdue digit"/gambler's-fallacy boosts.
+    scores[d] = longEdge * 0.25
+      + mediumEdge * 0.20
+      + shortEdge * 0.20
+      + transitionEdge * 0.35;
   }
 
   const ranked = [...Array(10).keys()].sort((a, b) => scores[b] - scores[a]);
   const best = ranked[0];
-  const margin = scores[best] - scores[ranked[1]];
-  const rawProbability = 0.10 + Math.max(0, scores[best]);
-  const modelAgreement = Math.max(0, Math.min(1, 0.5 + margin * 8));
+  const second = ranked[1];
+  const margin = scores[best] - scores[second];
+
+  const longEdge = probs[best] - 0.10;
+  const mediumEdge = smoothedProbability(mediumCounts[best], mediumTotal) - 0.10;
+  const shortEdge = smoothedProbability(shortCounts[best], shortTotal) - 0.10;
+  const transitionEdge = transitions >= config.minTransitionSamples
+    ? smoothedProbability(row[best], transitions, 0.5) - 0.10
+    : 0;
+  const componentVotes = [longEdge, mediumEdge, shortEdge, transitionEdge].filter(edge => edge > 0).length;
+  const modelAgreement = componentVotes / 4;
   const uncertaintyPenalty = Math.max(0, normalizedEntropy - 0.93);
+
+  const rawProbability = 0.10 + Math.max(0, scores[best]);
   const probability = Math.max(
     0.10,
     Math.min(
       config.maxProbability / 100,
-      rawProbability * (0.75 + 0.25 * modelAgreement) - uncertaintyPenalty * 0.05
+      rawProbability * (0.78 + 0.22 * modelAgreement) - uncertaintyPenalty * 0.04
     )
   );
-  const confidence = Math.max(0, Math.min(99, 100 * ((probability - 0.10) / 0.20)));
+  const confidence = Math.max(0, Math.min(99, 100 * ((probability - 0.10) / 0.14)));
   const signal = confidence >= config.confidenceFloor
     && margin >= config.marginFloor
-    && modelAgreement >= 0.55
+    && modelAgreement >= 0.75
+    && componentVotes >= 3
     && normalizedEntropy < config.entropyCeiling;
 
   return {
@@ -133,7 +161,9 @@ export function baseAnalyze(input, config = ENGINE_CONFIG) {
     scores,
     entropy: normalizedEntropy,
     margin,
-    reason: signal ? 'Multiple statistical features agree' : 'No sufficiently strong edge'
+    modelAgreement,
+    componentVotes,
+    reason: signal ? 'Multi-window and transition models agree' : 'No sufficiently strong multi-model edge'
   };
 }
 
@@ -141,7 +171,7 @@ export function calibrate(rawConfidence, calibration, config = ENGINE_CONFIG) {
   if (!calibration) {
     return {
       confidence: rawConfidence,
-      probability: 10 + rawConfidence * 0.20,
+      probability: 10 + rawConfidence * 0.14,
       calibrated: false,
       sampleSize: 0
     };
@@ -151,7 +181,7 @@ export function calibrate(rawConfidence, calibration, config = ENGINE_CONFIG) {
   if (!row || row.count < config.minCalibrationSamples) {
     return {
       confidence: rawConfidence,
-      probability: 10 + rawConfidence * 0.20,
+      probability: 10 + rawConfidence * 0.14,
       calibrated: false,
       sampleSize: row?.count || 0
     };
@@ -162,7 +192,7 @@ export function calibrate(rawConfidence, calibration, config = ENGINE_CONFIG) {
   const probability = 10 + (empirical - 10) * shrink;
 
   return {
-    confidence: Math.max(0, Math.min(99, (probability - 10) / 0.20)),
+    confidence: Math.max(0, Math.min(99, (probability - 10) / 0.14)),
     probability,
     calibrated: true,
     sampleSize: row.count
