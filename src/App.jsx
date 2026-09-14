@@ -1,332 +1,457 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import {
+  analyze,
+  lastDigit,
+  normalizeDigits,
+  walkForwardBacktest
+} from './engine/matchesEngine.js';
 
 const API_URL = 'wss://ws.derivws.com/websockets/v3?app_id=1089';
-const FALLBACK_SYMBOLS = [
-  { symbol: '1HZ10V', displayName: 'Volatility 10 (1s) Index' },
-  { symbol: '1HZ25V', displayName: 'Volatility 25 (1s) Index' },
-  { symbol: '1HZ50V', displayName: 'Volatility 50 (1s) Index' },
-  { symbol: '1HZ75V', displayName: 'Volatility 75 (1s) Index' },
-  { symbol: '1HZ100V', displayName: 'Volatility 100 (1s) Index' }
-];
 const MIN_TICKS = 100;
 const BACKTEST_TICKS = 1500;
 const BENCHMARK_TICKS = 1500;
 const MAX_BENCHMARK_MARKETS = 12;
 const MIN_CALIBRATION_SAMPLES = 20;
-const BUCKETS = [[0, 30], [30, 40], [40, 50], [50, 60], [60, 70], [70, 80], [80, 100]];
+const TICK_STALE_MS = 12000;
 
-function lastDigit(quote, pipSize) {
-  if (quote == null) return null;
-  const n = Number(quote);
-  if (!Number.isFinite(n)) return null;
-  if (Number.isInteger(pipSize) && pipSize >= 0 && pipSize <= 10) {
-    const chars = n.toFixed(pipSize).replace(/\D/g, '');
-    return chars ? Number(chars.at(-1)) : null;
-  }
-  const text = String(quote);
-  const decimal = text.includes('.') ? text.split('.')[1] : '';
-  const chars = decimal || text;
-  return chars ? Number(chars.at(-1)) : null;
+function normalizeActiveSymbol(item) {
+  const symbol = item?.underlying_symbol ?? item?.symbol;
+  const displayName = item?.underlying_symbol_name ?? item?.display_name ?? symbol;
+  if (!symbol || !displayName) return null;
+  const type = item?.underlying_symbol_type ?? item?.symbol_type ?? '';
+  const market = item?.market ?? '';
+  const submarket = item?.submarket ?? item?.subgroup ?? '';
+  const synthetic = /synthetic|volatility|crash|boom|jump|step|range\s*break|drift|daily\s*reset/i.test(
+    `${displayName} ${type} ${market} ${submarket}`
+  );
+  return {
+    symbol,
+    displayName,
+    pipSize: item?.pip_size ?? item?.pip ?? null,
+    market,
+    submarket,
+    type,
+    synthetic
+  };
 }
 
-function entropy(probabilities) {
-  return -probabilities.reduce((sum, p) => sum + (p > 0 ? p * Math.log2(p) : 0), 0);
-}
-
-function bucketIndex(confidence) {
-  const i = BUCKETS.findIndex(([lo, hi], index) => confidence >= lo && (index === BUCKETS.length - 1 ? confidence <= hi : confidence < hi));
-  return i < 0 ? BUCKETS.length - 1 : i;
-}
-
-function baseAnalyze(digits) {
-  if (digits.length < MIN_TICKS) return { signal: false, digit: null, confidence: 0, probability: 10, scores: Array(10).fill(0), reason: `Collecting ${MIN_TICKS - digits.length} more ticks`, entropy: 1, margin: 0 };
-  const recent = digits.slice(-100);
-  const short = digits.slice(-30);
-  const counts = Array(10).fill(0);
-  const shortCounts = Array(10).fill(0);
-  recent.forEach(d => counts[d]++);
-  short.forEach(d => shortCounts[d]++);
-  const probs = counts.map(c => c / recent.length);
-  const h = entropy(probs) / Math.log2(10);
-  const scores = Array(10).fill(0);
-  const last = digits.at(-1);
-  const transitionCounts = Array.from({ length: 10 }, () => Array(10).fill(0));
-  for (let i = 1; i < digits.length; i++) transitionCounts[digits[i - 1]][digits[i]]++;
-  const reversed = [...digits].reverse();
-  for (let d = 0; d < 10; d++) {
-    const longEdge = probs[d] - 0.10;
-    const shortEdge = shortCounts[d] / short.length - 0.10;
-    const row = transitionCounts[last];
-    const transitions = row.reduce((a, b) => a + b, 0);
-    const transitionProb = transitions >= 8 ? row[d] / transitions : 0.10;
-    const gap = reversed.indexOf(d);
-    const gapSignal = gap >= 8 && gap <= 35 ? 0.012 : 0;
-    const repeatPenalty = d === last ? -0.006 : 0;
-    scores[d] = longEdge * 0.40 + shortEdge * 0.25 + (transitionProb - 0.10) * 0.30 + gapSignal + repeatPenalty;
-  }
-  const ranked = [...Array(10).keys()].sort((a, b) => scores[b] - scores[a]);
-  const best = ranked[0];
-  const margin = scores[best] - scores[ranked[1]];
-  const rawProbability = 0.10 + Math.max(0, scores[best]);
-  const modelAgreement = Math.max(0, Math.min(1, 0.5 + margin * 8));
-  const uncertaintyPenalty = Math.max(0, h - 0.93);
-  const probability = Math.max(0.10, Math.min(0.40, rawProbability * (0.75 + 0.25 * modelAgreement) - uncertaintyPenalty * 0.05));
-  const confidence = Math.max(0, Math.min(99, 100 * ((probability - 0.10) / 0.20)));
-  const signal = confidence >= 24 && margin >= 0.012 && modelAgreement >= 0.55 && h < 0.995;
-  return { signal, digit: best, confidence, probability: probability * 100, scores, entropy: h, margin, reason: signal ? 'Multiple statistical features agree' : 'No sufficiently strong edge' };
-}
-
-function calibrate(rawConfidence, calibration) {
-  if (!calibration) return { confidence: rawConfidence, probability: 10 + rawConfidence * 0.20, calibrated: false, sampleSize: 0 };
-  const row = calibration.buckets[bucketIndex(rawConfidence)];
-  if (!row || row.count < MIN_CALIBRATION_SAMPLES) return { confidence: rawConfidence, probability: 10 + rawConfidence * 0.20, calibrated: false, sampleSize: row?.count || 0 };
-  const empirical = row.wins / row.count * 100;
-  const shrink = Math.min(0.75, row.count / 100);
-  const probability = 10 + (empirical - 10) * shrink;
-  return { confidence: Math.max(0, Math.min(99, (probability - 10) / 0.20)), probability, calibrated: true, sampleSize: row.count };
-}
-
-function analyze(digits, calibration) {
-  const raw = baseAnalyze(digits);
-  if (!raw.signal) return raw;
-  const c = calibrate(raw.confidence, calibration);
-  const qualified = c.calibrated ? c.probability >= 12 : raw.confidence >= 24;
-  return { ...raw, confidence: c.confidence, probability: c.probability, calibrated: c.calibrated, calibrationSamples: c.sampleSize, signal: qualified, reason: qualified ? (c.calibrated ? 'Validated by walk-forward calibration' : raw.reason) : 'Calibration did not confirm enough edge' };
-}
-
-function buildCalibration(results) {
-  const buckets = BUCKETS.map(([lo, hi]) => ({ lo, hi, count: 0, wins: 0, hitRate: 0 }));
-  results.forEach(r => { const row = buckets[bucketIndex(r.confidence)]; row.count++; if (r.win) row.wins++; });
-  buckets.forEach(row => { row.hitRate = row.count ? row.wins / row.count * 100 : 0; });
-  return { buckets, total: results.length };
-}
-
-function scoreValidation(results) {
-  let wins = 0, losses = 0, maxLosingStreak = 0, losingStreak = 0, probabilitySum = 0, brierSum = 0;
-  results.forEach(r => {
-    if (r.win) { wins++; losingStreak = 0; } else { losses++; losingStreak++; maxLosingStreak = Math.max(maxLosingStreak, losingStreak); }
-    probabilitySum += r.probability / 100;
-    brierSum += (r.probability / 100 - (r.win ? 1 : 0)) ** 2;
-  });
-  const signals = wins + losses;
-  return { signals, wins, losses, hitRate: signals ? wins / signals * 100 : 0, edge: signals ? wins / signals * 100 - 10 : 0, maxLosingStreak, avgProbability: signals ? probabilitySum / signals * 100 : 0, brier: signals ? brierSum / signals : null };
-}
-
-function walkForwardBacktest(digits) {
-  const all = [];
-  for (let i = MIN_TICKS; i < digits.length; i++) {
-    const prediction = baseAnalyze(digits.slice(0, i));
-    if (prediction.signal && prediction.digit != null) all.push({ index: i, predicted: prediction.digit, actual: digits[i], win: prediction.digit === digits[i], confidence: prediction.confidence, probability: prediction.probability });
-  }
-  const splitIndex = Math.max(1, Math.floor(all.length * 0.70));
-  const training = all.slice(0, splitIndex);
-  const validation = all.slice(splitIndex);
-  const calibration = buildCalibration(training);
-  const calibratedValidation = validation.map(r => { const c = calibrate(r.confidence, calibration); return { ...r, probability: c.probability, confidence: c.confidence }; });
-  return { observations: Math.max(0, digits.length - MIN_TICKS), candidates: all.length, trainingSignals: training.length, validationSignals: validation.length, noSignals: Math.max(0, digits.length - MIN_TICKS - all.length), calibration, raw: scoreValidation(validation), validated: scoreValidation(calibratedValidation), samples: calibratedValidation.slice(-30).reverse() };
-}
-
-function parseContractTypes(message) {
-  const cf = message?.contracts_for;
-  if (!cf) return [];
-  const list = Array.isArray(cf) ? cf : Object.values(cf).flatMap(v => Array.isArray(v) ? v : []);
-  return list.map(x => typeof x === 'string' ? x : (x?.contract_type || x?.contract_category || x?.type || '')).filter(Boolean).map(String).map(x => x.toUpperCase());
+function contractTypes(message) {
+  const available = message?.contracts_for?.available;
+  if (!Array.isArray(available)) return [];
+  return available
+    .map(item => String(item?.contract_type ?? '').toUpperCase())
+    .filter(Boolean);
 }
 
 function supportsMatches(message) {
-  return parseContractTypes(message).some(x => x === 'DIGITMATCH' || x.includes('DIGITMATCH') || x === 'MATCHDIGIT');
+  return contractTypes(message).some(type =>
+    type === 'DIGITMATCH' || type === 'MATCHDIGIT' || type.includes('DIGITMATCH')
+  );
 }
 
 function benchmarkRank(results) {
-  return [...results].filter(r => r.error == null).sort((a, b) => {
-    const sa = (a.validated.edge * 2) + Math.min(a.validated.signals, 100) * 0.05 - (a.validated.brier ?? 1) * 10 - a.validated.maxLosingStreak * 0.12;
-    const sb = (b.validated.edge * 2) + Math.min(b.validated.signals, 100) * 0.05 - (b.validated.brier ?? 1) * 10 - b.validated.maxLosingStreak * 0.12;
-    return sb - sa;
-  });
+  return [...results]
+    .filter(row => !row.error && row.validated)
+    .sort((a, b) => {
+      const score = row =>
+        row.validated.edge * 2 +
+        Math.min(row.validated.signals, 100) * 0.05 -
+        (row.validated.brier ?? 1) * 10 -
+        row.validated.maxLosingStreak * 0.12;
+      return score(b) - score(a);
+    });
 }
 
 export default function App() {
-  const [symbols, setSymbols] = useState(FALLBACK_SYMBOLS);
-  const [symbol, setSymbol] = useState(FALLBACK_SYMBOLS[0].symbol);
+  const [symbols, setSymbols] = useState([]);
+  const [symbol, setSymbol] = useState('');
   const [ticks, setTicks] = useState([]);
   const [connected, setConnected] = useState(false);
-  const [status, setStatus] = useState('Connecting…');
+  const [status, setStatus] = useState('Connecting to Deriv…');
   const [error, setError] = useState('');
   const [predictions, setPredictions] = useState([]);
   const [serverPipSize, setServerPipSize] = useState(null);
   const [eligible, setEligible] = useState(null);
-  const [eligibilityText, setEligibilityText] = useState('Checking Matches support…');
+  const [eligibilityText, setEligibilityText] = useState('Waiting for live symbol discovery…');
   const [backtestState, setBacktestState] = useState({ loading: false, result: null, error: '' });
   const [benchmark, setBenchmark] = useState({ loading: false, results: [], error: '', completed: 0, total: 0 });
+  const [lastTickAt, setLastTickAt] = useState(null);
+  const [streamSymbol, setStreamSymbol] = useState('');
+
   const ws = useRef(null);
+  const requestId = useRef(100);
   const pending = useRef(null);
-  const requestId = useRef(10);
   const benchmarkRef = useRef(null);
+  const activeSymbolReady = useRef(false);
+  const reconnectTimer = useRef(null);
+  const heartbeatTimer = useRef(null);
+  const mounted = useRef(true);
 
   const calibration = backtestState.result?.calibration || null;
+  const selectedMarket = symbols.find(item => item.symbol === symbol);
 
-  useEffect(() => {
-    const socket = new WebSocket(API_URL);
-    ws.current = socket;
-    socket.onopen = () => { setConnected(true); setStatus('Live market data'); setError(''); socket.send(JSON.stringify({ active_symbols: 'brief', product_type: 'basic', req_id: 1 })); };
-    socket.onmessage = event => {
-      try {
-        const m = JSON.parse(event.data);
-        if (m.error) {
-          if (benchmarkRef.current?.reqId === m.req_id) finishBenchmarkItem({ error: m.error.message || 'Deriv API error' });
-          else setError(m.error.message || 'Deriv API error');
-          return;
-        }
-        if (m.msg_type === 'active_symbols') {
-          const discovered = (m.active_symbols || []).filter(x => x.symbol && x.display_name).map(x => ({ symbol: x.symbol, displayName: x.display_name, pipSize: x.pip_size, market: x.market, submarket: x.submarket }));
-          if (discovered.length) {
-            const sorted = discovered.filter(x => /synthetic|volatility|crash|boom|jump|step|range|drift|daily/i.test(`${x.displayName} ${x.market || ''} ${x.submarket || ''}`)).sort((a, b) => a.displayName.localeCompare(b.displayName));
-            const usable = sorted.length ? sorted : discovered.sort((a, b) => a.displayName.localeCompare(b.displayName));
-            setSymbols(usable);
-            setSymbol(current => usable.some(x => x.symbol === current) ? current : usable[0].symbol);
-          }
-        }
-        if (m.msg_type === 'contracts_for') {
-          const match = supportsMatches(m);
-          if (benchmarkRef.current?.contractReqId === m.req_id) {
-            if (match) requestBenchmarkHistory(benchmarkRef.current.currentSymbol);
-            else finishBenchmarkItem({ error: 'Matches contract not available' });
-          } else {
-            setEligible(match);
-            setEligibilityText(match ? 'Matches contract available' : 'Matches contract not confirmed');
-          }
-        }
-        if (m.msg_type === 'tick' && m.tick?.quote != null) {
-          const pip = Number.isInteger(m.tick.pip_size) ? m.tick.pip_size : null;
-          setServerPipSize(pip);
-          const d = lastDigit(m.tick.quote, pip);
-          if (d != null) setTicks(prev => [...prev.slice(-2999), d]);
-        }
-        if (m.msg_type === 'history' && m.history?.prices) {
-          const pip = Number.isInteger(m.pip_size) ? m.pip_size : null;
-          const prices = m.history.prices.map(q => lastDigit(q, pip)).filter(Number.isInteger);
-          if (benchmarkRef.current?.reqId === m.req_id) {
-            if (prices.length >= MIN_TICKS + 1) finishBenchmarkItem({ result: walkForwardBacktest(prices) });
-            else finishBenchmarkItem({ error: `Only ${prices.length} valid ticks returned` });
-          } else if (prices.length >= MIN_TICKS + 1) setBacktestState({ loading: false, error: '', result: walkForwardBacktest(prices) });
-          else setBacktestState({ loading: false, error: `Only ${prices.length} valid ticks were returned.`, result: null });
-        }
-      } catch { setError('Invalid market response.'); }
-    };
-    socket.onerror = () => { setConnected(false); setStatus('Connection error'); };
-    socket.onclose = () => { setConnected(false); setStatus('Disconnected'); };
-    return () => { socket.close(); if (ws.current === socket) ws.current = null; };
-  }, []);
+  const send = (payload) => {
+    if (ws.current?.readyState !== WebSocket.OPEN) return false;
+    ws.current.send(JSON.stringify(payload));
+    return true;
+  };
 
-  useEffect(() => {
-    if (!ws.current || ws.current.readyState !== WebSocket.OPEN || !symbol) return;
-    ws.current.send(JSON.stringify({ forget_all: 'ticks' }));
-    ws.current.send(JSON.stringify({ contracts_for: symbol, req_id: requestId.current++ }));
-    ws.current.send(JSON.stringify({ ticks: symbol, subscribe: 1, req_id: requestId.current++ }));
-    setTicks([]); setPredictions([]); pending.current = null; setEligible(null); setEligibilityText('Checking Matches support…'); setBacktestState({ loading: false, result: null, error: '' });
-  }, [symbol, connected]);
-
-  const analysis = useMemo(() => analyze(ticks, calibration), [ticks, calibration]);
-  const counts = useMemo(() => Array.from({ length: 10 }, (_, d) => ticks.slice(-100).filter(x => x === d).length), [ticks]);
-  const maxCount = Math.max(1, ...counts);
-
-  useEffect(() => {
-    if (!ticks.length) return;
-    if (pending.current && ticks.length > pending.current.tickCount) {
-      const outcome = ticks.at(-1) === pending.current.digit ? 'WIN' : 'LOSS';
-      setPredictions(prev => [{ ...pending.current, result: outcome, at: new Date().toLocaleTimeString() }, ...prev].slice(0, 100));
-      pending.current = null;
+  const handleServerError = (message) => {
+    const text = message || 'Deriv API returned an error.';
+    if (benchmarkRef.current?.reqId === message?.req_id) {
+      finishBenchmarkItem({ error: text });
+      return;
     }
-    if (analysis.signal && analysis.digit != null && !pending.current) pending.current = { tickCount: ticks.length, digit: analysis.digit, confidence: analysis.confidence, probability: analysis.probability, calibrated: analysis.calibrated };
-  }, [ticks, analysis]);
-
-  function runBacktest() {
-    if (!ws.current || ws.current.readyState !== WebSocket.OPEN) return setBacktestState({ loading: false, result: null, error: 'Connect to Deriv before running validation.' });
-    setBacktestState({ loading: true, result: null, error: '' });
-    ws.current.send(JSON.stringify({ ticks_history: symbol, end: 'latest', count: BACKTEST_TICKS, style: 'ticks', req_id: requestId.current++ }));
-  }
-
-  function requestBenchmarkHistory(nextSymbol) {
-    if (!ws.current || ws.current.readyState !== WebSocket.OPEN) return finishBenchmarkItem({ error: 'WebSocket disconnected' });
-    const reqId = requestId.current++;
-    benchmarkRef.current.reqId = reqId;
-    benchmarkRef.current.currentSymbol = nextSymbol;
-    ws.current.send(JSON.stringify({ ticks_history: nextSymbol, end: 'latest', count: BENCHMARK_TICKS, style: 'ticks', req_id: reqId }));
-  }
+    setError(text);
+    setStatus('Deriv feed error');
+  };
 
   function finishBenchmarkItem(payload) {
     const state = benchmarkRef.current;
     if (!state) return;
-    const row = { symbol: state.currentSymbol, name: state.names[state.currentSymbol] || state.currentSymbol, ...(payload.result ? payload.result : { error: payload.error || 'Unknown error' }) };
+    const current = state.currentSymbol;
+    const name = state.names[current] || current;
+    const row = payload.result
+      ? { symbol: current, name, ...payload.result }
+      : { symbol: current, name, error: payload.error || 'Unknown benchmark error' };
     state.results = [...state.results, row];
     state.index += 1;
-    setBenchmark({ loading: true, results: benchmarkRank(state.results), error: '', completed: state.index, total: state.queue.length });
+    setBenchmark({
+      loading: state.index < state.queue.length,
+      results: benchmarkRank(state.results),
+      error: '',
+      completed: state.index,
+      total: state.queue.length
+    });
     if (state.index >= state.queue.length) {
-      setBenchmark({ loading: false, results: benchmarkRank(state.results), error: '', completed: state.index, total: state.queue.length });
       benchmarkRef.current = null;
       return;
     }
     const next = state.queue[state.index];
     state.currentSymbol = next;
     state.contractReqId = requestId.current++;
-    ws.current.send(JSON.stringify({ contracts_for: next, req_id: state.contractReqId }));
+    send({ contracts_for: next, req_id: state.contractReqId });
+  }
+
+  function requestBenchmarkHistory(nextSymbol) {
+    const state = benchmarkRef.current;
+    if (!state || ws.current?.readyState !== WebSocket.OPEN) {
+      finishBenchmarkItem({ error: 'Deriv WebSocket disconnected.' });
+      return;
+    }
+    const reqId = requestId.current++;
+    state.reqId = reqId;
+    state.currentSymbol = nextSymbol;
+    send({ ticks_history: nextSymbol, end: 'latest', count: BENCHMARK_TICKS, style: 'ticks', req_id: reqId });
+  }
+
+  function processHistory(message) {
+    const pip = Number.isFinite(Number(message?.pip_size)) ? Number(message.pip_size) : null;
+    const prices = Array.isArray(message?.history?.prices)
+      ? normalizeDigits(message.history.prices.map(quote => lastDigit(quote, pip)))
+      : [];
+
+    if (benchmarkRef.current?.reqId === message?.req_id) {
+      if (prices.length >= MIN_TICKS + 1) finishBenchmarkItem({ result: walkForwardBacktest(prices) });
+      else finishBenchmarkItem({ error: `Only ${prices.length} valid historical ticks returned.` });
+      return;
+    }
+
+    if (prices.length >= MIN_TICKS + 1) {
+      setBacktestState({ loading: false, error: '', result: walkForwardBacktest(prices) });
+    } else {
+      setBacktestState({ loading: false, result: null, error: `Deriv returned only ${prices.length} usable historical ticks.` });
+    }
+  }
+
+  function handleMessage(message) {
+    if (message?.error) {
+      const text = message.error.message || 'Deriv API error.';
+      if (benchmarkRef.current?.reqId === message.req_id || benchmarkRef.current?.contractReqId === message.req_id) {
+        finishBenchmarkItem({ error: text });
+      } else {
+        setError(text);
+        setStatus('Deriv feed error');
+      }
+      return;
+    }
+
+    if (message?.msg_type === 'active_symbols') {
+      const discovered = (message.active_symbols || [])
+        .map(normalizeActiveSymbol)
+        .filter(Boolean);
+      const synthetic = discovered.filter(item => item.synthetic);
+      const usable = (synthetic.length ? synthetic : discovered)
+        .sort((a, b) => a.displayName.localeCompare(b.displayName));
+
+      activeSymbolReady.current = usable.length > 0;
+      setSymbols(usable);
+      setError('');
+      setStatus(usable.length ? 'Live market data ready' : 'Connected, but Deriv returned no active markets');
+      if (!usable.some(item => item.symbol === symbol)) setSymbol(usable[0]?.symbol || '');
+      return;
+    }
+
+    if (message?.msg_type === 'contracts_for') {
+      const match = supportsMatches(message);
+      if (benchmarkRef.current?.contractReqId === message.req_id) {
+        if (match) requestBenchmarkHistory(benchmarkRef.current.currentSymbol);
+        else finishBenchmarkItem({ error: 'Matches contract not available for this market.' });
+      } else {
+        setEligible(match);
+        setEligibilityText(match ? 'Matches contract available from Deriv' : 'Matches contract not offered for this market');
+      }
+      return;
+    }
+
+    if (message?.msg_type === 'tick' && message.tick?.quote != null) {
+      const incomingSymbol = message.tick.symbol || message.echo_req?.ticks || '';
+      if (symbol && incomingSymbol && incomingSymbol !== symbol) return;
+      const pip = Number.isInteger(message.tick.pip_size) ? message.tick.pip_size : selectedMarket?.pipSize ?? null;
+      const digit = lastDigit(message.tick.quote, pip);
+      if (digit == null) return;
+      setServerPipSize(pip);
+      setStreamSymbol(incomingSymbol || symbol);
+      setLastTickAt(Date.now());
+      setTicks(previous => [...previous.slice(-2999), digit]);
+      return;
+    }
+
+    if (message?.msg_type === 'history') processHistory(message);
+  }
+
+  useEffect(() => {
+    mounted.current = true;
+
+    const connect = () => {
+      if (!mounted.current) return;
+      if (ws.current && ws.current.readyState <= WebSocket.OPEN) return;
+      setStatus('Connecting to Deriv live feed…');
+      const socket = new WebSocket(API_URL);
+      ws.current = socket;
+
+      socket.onopen = () => {
+        if (!mounted.current) return;
+        setConnected(true);
+        setStatus('Connected to Deriv');
+        setError('');
+        activeSymbolReady.current = false;
+        send({ active_symbols: 'brief', req_id: requestId.current++ });
+      };
+
+      socket.onmessage = event => {
+        try {
+          handleMessage(JSON.parse(event.data));
+        } catch {
+          setError('Received an unreadable response from Deriv.');
+        }
+      };
+
+      socket.onerror = () => {
+        if (!mounted.current) return;
+        setConnected(false);
+        setStatus('Deriv WebSocket error');
+      };
+
+      socket.onclose = () => {
+        if (!mounted.current) return;
+        setConnected(false);
+        activeSymbolReady.current = false;
+        setStatus('Disconnected — reconnecting…');
+        clearTimeout(reconnectTimer.current);
+        reconnectTimer.current = setTimeout(connect, 2500);
+      };
+    };
+
+    connect();
+    heartbeatTimer.current = setInterval(() => send({ ping: 1, req_id: requestId.current++ }), 30000);
+
+    return () => {
+      mounted.current = false;
+      clearTimeout(reconnectTimer.current);
+      clearInterval(heartbeatTimer.current);
+      if (ws.current) {
+        try { ws.current.close(); } catch {}
+        ws.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!connected || !activeSymbolReady.current || !symbol) return;
+    send({ forget_all: 'ticks', req_id: requestId.current++ });
+    setTicks([]);
+    setPredictions([]);
+    setLastTickAt(null);
+    setStreamSymbol('');
+    setServerPipSize(selectedMarket?.pipSize ?? null);
+    setEligible(null);
+    setEligibilityText('Checking Matches support…');
+    setBacktestState({ loading: false, result: null, error: '' });
+    pending.current = null;
+
+    send({ contracts_for: symbol, req_id: requestId.current++ });
+    const tickReqId = requestId.current++;
+    if (!send({ ticks: symbol, subscribe: 1, req_id: tickReqId })) {
+      setError('Could not start the Deriv tick subscription.');
+      return;
+    }
+    setStatus('Streaming live Deriv ticks');
+  }, [connected, symbol]);
+
+  useEffect(() => {
+    if (!lastTickAt) return;
+    const timer = setInterval(() => {
+      if (Date.now() - lastTickAt > TICK_STALE_MS) {
+        setStatus('Connected, but tick stream is stale');
+      }
+    }, 2000);
+    return () => clearInterval(timer);
+  }, [lastTickAt]);
+
+  const analysis = useMemo(() => analyze(ticks, calibration), [ticks, calibration]);
+  const counts = useMemo(() => {
+    const recent = ticks.slice(-100);
+    return Array.from({ length: 10 }, (_, digit) => recent.filter(value => value === digit).length);
+  }, [ticks]);
+  const maxCount = Math.max(1, ...counts);
+
+  useEffect(() => {
+    if (!ticks.length) return;
+    if (pending.current && ticks.length > pending.current.tickCount) {
+      const outcome = ticks.at(-1) === pending.current.digit ? 'WIN' : 'LOSS';
+      setPredictions(previous => [
+        { ...pending.current, result: outcome, at: new Date().toLocaleTimeString() },
+        ...previous
+      ].slice(0, 100));
+      pending.current = null;
+    }
+    if (analysis.signal && analysis.digit != null && !pending.current) {
+      pending.current = {
+        tickCount: ticks.length,
+        digit: analysis.digit,
+        confidence: analysis.confidence,
+        probability: analysis.probability,
+        calibrated: analysis.calibrated
+      };
+    }
+  }, [ticks, analysis]);
+
+  function runBacktest() {
+    if (ws.current?.readyState !== WebSocket.OPEN || !symbol) {
+      setBacktestState({ loading: false, result: null, error: 'Connect to Deriv and select a market first.' });
+      return;
+    }
+    setBacktestState({ loading: true, result: null, error: '' });
+    send({ ticks_history: symbol, end: 'latest', count: BACKTEST_TICKS, style: 'ticks', req_id: requestId.current++ });
   }
 
   function runBenchmark() {
-    if (!ws.current || ws.current.readyState !== WebSocket.OPEN) { setBenchmark(b => ({ ...b, error: 'Connect to Deriv before benchmarking.' })); return; }
+    if (ws.current?.readyState !== WebSocket.OPEN || !symbols.length) {
+      setBenchmark(previous => ({ ...previous, error: 'Deriv live connection is not ready.' }));
+      return;
+    }
     const candidates = symbols.slice(0, MAX_BENCHMARK_MARKETS);
-    if (!candidates.length) return;
-    const names = Object.fromEntries(candidates.map(x => [x.symbol, x.displayName]));
-    const queue = candidates.map(x => x.symbol);
-    benchmarkRef.current = { queue, names, index: 0, results: [], currentSymbol: queue[0], contractReqId: requestId.current++ };
+    const names = Object.fromEntries(candidates.map(item => [item.symbol, item.displayName]));
+    const queue = candidates.map(item => item.symbol);
+    benchmarkRef.current = {
+      queue,
+      names,
+      index: 0,
+      results: [],
+      currentSymbol: queue[0],
+      contractReqId: requestId.current++
+    };
     setBenchmark({ loading: true, results: [], error: '', completed: 0, total: queue.length });
-    ws.current.send(JSON.stringify({ contracts_for: queue[0], req_id: benchmarkRef.current.contractReqId }));
+    send({ contracts_for: queue[0], req_id: benchmarkRef.current.contractReqId });
   }
 
-  const wins = predictions.filter(p => p.result === 'WIN').length;
-  const losses = predictions.filter(p => p.result === 'LOSS').length;
+  const wins = predictions.filter(item => item.result === 'WIN').length;
+  const losses = predictions.filter(item => item.result === 'LOSS').length;
   const settled = wins + losses;
   const liveHitRate = settled ? (wins / settled * 100).toFixed(1) : '—';
-  const selectedName = symbols.find(x => x.symbol === symbol)?.displayName || symbol;
+  const selectedName = selectedMarket?.displayName || (symbol ? symbol : 'Waiting for Deriv symbols…');
+  const tickAge = lastTickAt ? Math.max(0, Math.round((Date.now() - lastTickAt) / 1000)) : null;
   const validated = backtestState.result?.validated;
-  const validationReady = validated && validated.signals >= 20 && validated.edge > 0;
+  const validationReady = Boolean(validated && validated.signals >= 20 && validated.edge > 0);
   const best = benchmark.results[0];
-  const bestReady = best && !best.error && best.validated.signals >= 20 && best.validated.edge > 0;
+  const bestReady = Boolean(best && best.validated?.signals >= 20 && best.validated?.edge > 0);
 
   return <div className="app">
     <header>
-      <div><span className="eyebrow">DERIV • MATCHES ANALYSIS</span><h1>Matches Analysis <b>PRO</b></h1><p>Live digit analysis with walk-forward validation, calibration and multi-market benchmarking.</p></div>
-      <div className={connected ? 'status live' : 'status'}><i/> {connected ? 'LIVE' : 'OFFLINE'}</div>
+      <div>
+        <span className="eyebrow">DERIV • MATCHES ANALYSIS</span>
+        <h1>Matches Analysis <b>PRO</b></h1>
+        <p>Live digit analysis using the actual active Deriv market list, real-time ticks, walk-forward validation and calibration.</p>
+      </div>
+      <div className={connected && lastTickAt && tickAge <= 12 ? 'status live' : 'status'}>
+        <i/> {connected && lastTickAt && tickAge <= 12 ? 'LIVE' : connected ? 'CONNECTED' : 'OFFLINE'}
+      </div>
     </header>
+
     <main>
       <section className="controls card">
-        <label>Market<select value={symbol} onChange={e => setSymbol(e.target.value)}>{symbols.map(x => <option key={x.symbol} value={x.symbol}>{x.displayName}</option>)}</select></label>
-        <div className={`metric ${eligible === true ? 'ok' : eligible === false ? 'bad' : ''}`}><span>Matches</span><strong>{eligible === true ? 'ELIGIBLE' : eligible === false ? 'CHECK' : '…'}</strong></div>
+        <label>
+          Market
+          <select value={symbol} onChange={event => setSymbol(event.target.value)} disabled={!symbols.length}>
+            {!symbols.length && <option value="">Waiting for active Deriv markets…</option>}
+            {symbols.map(item => <option key={item.symbol} value={item.symbol}>{item.displayName}</option>)}
+          </select>
+        </label>
+        <div className={`metric ${eligible === true ? 'ok' : eligible === false ? 'bad' : ''}`}><span>Matches</span><strong>{eligible === true ? 'ELIGIBLE' : eligible === false ? 'NOT AVAILABLE' : '…'}</strong></div>
         <div className="metric"><span>Ticks</span><strong>{ticks.length}</strong></div>
         <div className="metric"><span>Live hit</span><strong>{liveHitRate}{settled ? '%' : ''}</strong></div>
       </section>
-      {error && <div className="card error">{error}</div>}
-      <section className="card eligibility"><div><b>{eligibilityText}</b><small>{selectedName} • pip size {serverPipSize ?? 'auto'} • baseline per digit ≈ 10%</small></div><span className={eligible === true ? 'badge ok' : eligible === false ? 'badge bad' : 'badge'}>{eligible === true ? 'CONTRACT READY' : eligible === false ? 'NOT VERIFIED' : 'VERIFYING'}</span></section>
 
-      <section className="hero card"><div><span className="eyebrow">NEXT MATCH CANDIDATE</span>{analysis.signal ? <div className="big-digit">{analysis.digit}</div> : <div className="no-signal">NO SIGNAL</div>}<p>{analysis.reason}. Estimated probability: <strong>{analysis.probability.toFixed(1)}%</strong> • Confidence: <strong>{analysis.confidence.toFixed(1)}%</strong></p><small>{analysis.calibrated ? `Calibrated from ${analysis.calibrationSamples} validation samples` : 'Calibration pending • model is statistical, not guaranteed'}</small></div><div className="hero-side"><span>Model state</span><strong>{ticks.length < MIN_TICKS ? 'WARMING UP' : analysis.signal ? 'QUALIFIED' : 'WAITING'}</strong><small>{Math.max(0, MIN_TICKS - ticks.length)} observations until full warm-up</small></div></section>
+      <section className="card eligibility">
+        <div>
+          <b>{status}</b>
+          <small>{selectedName} • pip size {serverPipSize ?? 'auto'} • {streamSymbol ? `stream: ${streamSymbol}` : 'waiting for tick stream'}</small>
+        </div>
+        <span className={lastTickAt && tickAge <= 12 ? 'badge ok' : connected ? 'badge' : 'badge bad'}>
+          {lastTickAt && tickAge <= 12 ? `REAL DERIV TICKS${tickAge === 0 ? '' : ` • ${tickAge}s ago`}` : connected ? 'WAITING FOR TICKS' : 'OFFLINE'}
+        </span>
+      </section>
+
+      {error && <div className="card error">{error}</div>}
+
+      <section className="card eligibility">
+        <div><b>{eligibilityText}</b><small>{symbols.length} active Deriv market{symbols.length === 1 ? '' : 's'} discovered dynamically • no hard-coded synthetic symbol is assumed valid</small></div>
+        <span className={eligible === true ? 'badge ok' : eligible === false ? 'badge bad' : 'badge'}>{eligible === true ? 'CONTRACT READY' : eligible === false ? 'NOT OFFERED' : 'VERIFYING'}</span>
+      </section>
+
+      <section className="hero card">
+        <div>
+          <span className="eyebrow">NEXT MATCH CANDIDATE</span>
+          {analysis.signal ? <div className="big-digit">{analysis.digit}</div> : <div className="no-signal">NO SIGNAL</div>}
+          <p>{analysis.reason}. Estimated probability: <strong>{Number(analysis.probability || 10).toFixed(1)}%</strong> • Confidence: <strong>{Number(analysis.confidence || 0).toFixed(1)}%</strong></p>
+          <small>{analysis.calibrated ? `Calibrated from ${analysis.calibrationSamples} validation samples` : 'Calibration pending • model is statistical, not guaranteed'}</small>
+        </div>
+        <div className="hero-side"><span>Model state</span><strong>{ticks.length < MIN_TICKS ? 'WARMING UP' : analysis.signal ? 'QUALIFIED' : 'WAITING'}</strong><small>{Math.max(0, MIN_TICKS - ticks.length)} observations until full warm-up</small></div>
+      </section>
 
       <section className="grid">
-        <div className="card"><div className="section-title"><h2>Digit distribution</h2><span>Last {Math.min(100, ticks.length)}</span></div><div className="digits">{counts.map((c, d) => <div className="digit-row" key={d}><b>{d}</b><div className="bar"><i style={{ width: `${c / maxCount * 100}%` }}/></div><span>{c}</span></div>)}</div></div>
-        <div className="card"><div className="section-title"><h2>Live audit</h2><span>{predictions.length} settled</span></div><div className="audit">{predictions.length ? predictions.slice(0, 10).map((p, i) => <div className="audit-row" key={`${p.at}-${i}`}><b>{p.digit}</b><span>{p.confidence.toFixed(0)}%</span><span>{p.probability.toFixed(1)}%</span><strong className={p.result === 'WIN' ? 'win' : 'loss'}>{p.result}</strong></div>) : <p className="muted">No settled predictions yet.</p>}</div></div>
+        <div className="card"><div className="section-title"><h2>Digit distribution</h2><span>Last {Math.min(100, ticks.length)}</span></div><div className="digits">{counts.map((count, digit) => <div className="digit-row" key={digit}><b>{digit}</b><div className="bar"><i style={{ width: `${count / maxCount * 100}%` }}/></div><span>{count}</span></div>)}</div></div>
+        <div className="card"><div className="section-title"><h2>Live audit</h2><span>{predictions.length} settled</span></div><div className="audit">{predictions.length ? predictions.slice(0, 10).map((item, index) => <div className="audit-row" key={`${item.at}-${index}`}><b>{item.digit}</b><span>{item.confidence.toFixed(0)}%</span><span>{item.probability.toFixed(1)}%</span><strong className={item.result === 'WIN' ? 'win' : 'loss'}>{item.result}</strong></div>) : <p className="muted">No settled predictions yet.</p>}</div></div>
       </section>
 
       <section className="card validation">
-        <div className="section-title"><div><h2>Multi-market benchmark</h2><small>Ranks up to {MAX_BENCHMARK_MARKETS} discovered markets using unseen validation, edge, Brier score and losing streak.</small></div><button onClick={runBenchmark} disabled={benchmark.loading}>{benchmark.loading ? `SCANNING ${benchmark.completed}/${benchmark.total}` : 'SCAN BEST MARKET'}</button></div>
+        <div className="section-title"><div><h2>Multi-market benchmark</h2><small>Ranks only markets actually returned by Deriv. No unavailable or hard-coded symbols are tested.</small></div><button onClick={runBenchmark} disabled={benchmark.loading || !symbols.length}>{benchmark.loading ? `SCANNING ${benchmark.completed}/${benchmark.total}` : 'SCAN BEST MARKET'}</button></div>
         {benchmark.error && <div className="error inline">{benchmark.error}</div>}
         {best && <div className={`validation-status ${bestReady ? 'ready' : 'hold'}`}><b>{bestReady ? 'BEST VALIDATED MARKET' : 'NO PROMOTED MARKET'}</b><span>{best.name} • {best.validated.hitRate.toFixed(1)}% hit • {best.validated.edge >= 0 ? '+' : ''}{best.validated.edge.toFixed(1)}% edge • {best.validated.signals} unseen signals</span></div>}
-        <div className="calibration-table"><div className="cal-head"><span>Rank</span><span>Market</span><span>Hit</span><span>Edge</span></div>{benchmark.results.length ? benchmark.results.slice(0, 8).map((r, i) => <div className="cal-row" key={r.symbol}><span>#{i + 1}</span><span>{r.name}</span><span>{r.error ? 'ERR' : `${r.validated.hitRate.toFixed(1)}%`}</span><span>{r.error ? '—' : `${r.validated.edge >= 0 ? '+' : ''}${r.validated.edge.toFixed(1)}%`}</span></div>) : <p className="muted">Run the benchmark to find the strongest statistically validated market. No market is promoted automatically without out-of-sample evidence.</p>}</div>
+        <div className="calibration-table"><div className="cal-head"><span>Rank</span><span>Market</span><span>Hit</span><span>Edge</span></div>{benchmark.results.length ? benchmark.results.slice(0, 8).map((row, index) => <div className="cal-row" key={row.symbol}><span>#{index + 1}</span><span>{row.name}</span><span>{row.validated.hitRate.toFixed(1)}%</span><span>{row.validated.edge >= 0 ? '+' : ''}{row.validated.edge.toFixed(1)}%</span></div>) : <p className="muted">Run the benchmark to compare real active markets. A market is not promoted automatically without unseen validation.</p>}</div>
       </section>
 
       <section className="card validation">
-        <div className="section-title"><div><h2>Walk-forward validation</h2><small>70% calibration / 30% unseen validation • next-tick causality</small></div><button onClick={runBacktest} disabled={backtestState.loading}>{backtestState.loading ? 'RUNNING…' : 'RUN VALIDATION'}</button></div>
+        <div className="section-title"><div><h2>Walk-forward validation</h2><small>70% calibration / 30% unseen validation • next-tick causality</small></div><button onClick={runBacktest} disabled={backtestState.loading || !symbol}>{backtestState.loading ? 'RUNNING…' : 'RUN VALIDATION'}</button></div>
         {backtestState.error && <div className="error inline">{backtestState.error}</div>}
-        {!backtestState.result && !backtestState.loading && <p className="muted">Run validation to measure whether the model has a real edge on the selected market.</p>}
-        {backtestState.result && <><div className="validation-grid"><div><span>Validation hit</span><strong>{validated.hitRate.toFixed(1)}%</strong></div><div><span>Edge vs 10%</span><strong>{validated.edge >= 0 ? '+' : ''}{validated.edge.toFixed(1)}%</strong></div><div><span>Signals</span><strong>{validated.signals}</strong></div><div><span>Max loss streak</span><strong>{validated.maxLosingStreak}</strong></div><div><span>Avg predicted</span><strong>{validated.avgProbability.toFixed(1)}%</strong></div><div><span>Brier score</span><strong>{validated.brier == null ? '—' : validated.brier.toFixed(3)}</strong></div></div><div className={`validation-status ${validationReady ? 'ready' : 'hold'}`}><b>{validationReady ? 'CALIBRATION READY' : 'HOLD / MORE DATA'}</b><span>{validationReady ? 'Live signals may use empirical calibration.' : 'The app stays conservative until enough unseen samples confirm an edge.'}</span></div><div className="calibration-table"><div className="cal-head"><span>Confidence</span><span>Samples</span><span>Actual hit</span><span>Status</span></div>{backtestState.result.calibration.buckets.map((b, i) => <div className="cal-row" key={i}><span>{b.lo}–{b.hi}%</span><span>{b.count}</span><span>{b.count ? `${b.hitRate.toFixed(1)}%` : '—'}</span><span>{b.count >= MIN_CALIBRATION_SAMPLES ? 'VALID' : 'THIN'}</span></div>)}</div><p className="muted">Raw validation: {backtestState.result.raw.hitRate.toFixed(1)}% • Calibrated validation: {validated.hitRate.toFixed(1)}% • Statistical validation is not guaranteed profit.</p></>}
+        {!backtestState.result && !backtestState.loading && <p className="muted">Run validation to measure whether the model has a real edge on the selected live Deriv market.</p>}
+        {backtestState.result && validated && <>
+          <div className="validation-grid"><div><span>Validation hit</span><strong>{validated.hitRate.toFixed(1)}%</strong></div><div><span>Edge vs 10%</span><strong>{validated.edge >= 0 ? '+' : ''}{validated.edge.toFixed(1)}%</strong></div><div><span>Signals</span><strong>{validated.signals}</strong></div><div><span>Max loss streak</span><strong>{validated.maxLosingStreak}</strong></div><div><span>Avg predicted</span><strong>{validated.avgProbability.toFixed(1)}%</strong></div><div><span>Brier score</span><strong>{validated.brier == null ? '—' : validated.brier.toFixed(3)}</strong></div></div>
+          <div className={`validation-status ${validationReady ? 'ready' : 'hold'}`}><b>{validationReady ? 'CALIBRATION READY' : 'HOLD / MORE DATA'}</b><span>{validationReady ? 'Live signals may use empirical calibration.' : 'The app stays conservative until enough unseen samples confirm an edge.'}</span></div>
+          <div className="calibration-table"><div className="cal-head"><span>Confidence</span><span>Samples</span><span>Actual hit</span><span>Status</span></div>{backtestState.result.calibration.buckets.map((bucket, index) => <div className="cal-row" key={index}><span>{bucket.lo}–{bucket.hi}%</span><span>{bucket.count}</span><span>{bucket.count ? `${bucket.hitRate.toFixed(1)}%` : '—'}</span><span>{bucket.count >= MIN_CALIBRATION_SAMPLES ? 'VALID' : 'THIN'}</span></div>)}</div>
+          <p className="muted">Raw validation: {backtestState.result.raw.hitRate.toFixed(1)}% • Calibrated validation: {validated.hitRate.toFixed(1)}% • Statistical validation is not guaranteed profit.</p>
+        </>}
       </section>
     </main>
   </div>;
